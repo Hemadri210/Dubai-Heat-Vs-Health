@@ -19,6 +19,7 @@
   html, body { margin: 0; padding: 0; background: #12141C; }
   body { font-family: 'Inter', sans-serif; }
   button { font-family: inherit; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
   input, select, textarea { font-family: inherit; }
   input::placeholder, textarea::placeholder { color: #5A5F73; }
   #root { min-height: 100vh; }
@@ -81,6 +82,22 @@
 <body>
 <div id="root">
   <div class="page">
+
+    <section class="card" id="auth-card">
+      <div class="cardHeader"><span>🔑</span><h2 class="h2">Sign in</h2></div>
+      <div id="auth-signed-out">
+        <p class="subtle" style="margin-top:0;">Sign in with your email to back this up and unlock the team view later. You can also skip this and keep using it locally only — nothing else on this page needs it yet.</p>
+        <div class="foodFormRow">
+          <input class="input" id="auth-email" type="email" placeholder="you@example.com" autocomplete="email" />
+          <button class="pillBtn" id="auth-send-btn" style="flex:0 0 auto;padding:9px 16px;">Send link</button>
+        </div>
+        <p id="auth-status" style="font-size:12px;margin-top:8px;min-height:16px;color:#8B90A8;"></p>
+      </div>
+      <div id="auth-signed-in" style="display:none;">
+        <p class="subtle" style="margin-top:0;">Signed in as <strong id="auth-email-display" style="color:#EEF0F6;"></strong></p>
+        <button class="pillBtn pillBtnGhost" id="auth-signout-btn" style="width:auto;padding:8px 16px;">Sign out</button>
+      </div>
+    </section>
 
     <header class="header">
       <div>
@@ -296,6 +313,148 @@ function countLoggedDays() {
 
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ---------------------------------------------------------------
+   Auth (hand-written against Supabase's REST/Auth API directly —
+   no SDK, so this stays a single dependency-free file). Talks to
+   your Supabase project only when you actually sign in; the
+   tracker itself never requires it.
+---------------------------------------------------------------- */
+const SUPABASE_URL = 'https://mcytbvpjbowcqzeebofg.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_70GUylVg03qZ7AqT5YBoDw_YEyRqvVb';
+const AUTH_SESSION_KEY = 'heat_tracker_session';
+
+function decodeJwt(token) {
+  try {
+    const payload = token.split('.')[1];
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '=='.slice(0, (4 - base64.length % 4) % 4);
+    const json = decodeURIComponent(
+      atob(padded).split('').map((c) => '%' + c.charCodeAt(0).toString(16).padStart(2, '0')).join('')
+    );
+    return JSON.parse(json);
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveSession(session) {
+  try { localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(session)); } catch (e) {}
+}
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(AUTH_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+function clearSession() {
+  try { localStorage.removeItem(AUTH_SESSION_KEY); } catch (e) {}
+}
+
+function currentUser() {
+  const session = loadSession();
+  if (!session || !session.access_token) return null;
+  const payload = decodeJwt(session.access_token);
+  if (!payload) return null;
+  if (payload.exp && Date.now() / 1000 > payload.exp) return null;
+  return { id: payload.sub, email: payload.email, session };
+}
+
+async function sendMagicLink(email) {
+  const redirectTo = window.location.origin + window.location.pathname;
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/otp?redirect_to=${encodeURIComponent(redirectTo)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_KEY },
+    body: JSON.stringify({ email, create_user: true }),
+  });
+  if (!res.ok) {
+    let msg = 'Something went wrong sending the link.';
+    try {
+      const err = await res.json();
+      msg = err.msg || err.message || err.error_description || msg;
+    } catch (e) {}
+    throw new Error(msg);
+  }
+  return true;
+}
+
+function handleAuthRedirect() {
+  const hash = window.location.hash;
+  if (!hash || hash.length < 2) return false;
+  const params = new URLSearchParams(hash.slice(1));
+  const accessToken = params.get('access_token');
+  const refreshToken = params.get('refresh_token');
+  const expiresIn = params.get('expires_in');
+  const tokenType = params.get('token_type');
+  const errorDescription = params.get('error_description');
+
+  if (errorDescription) {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    return { error: decodeURIComponent(errorDescription.replace(/\+/g, ' ')) };
+  }
+  if (accessToken && refreshToken) {
+    saveSession({
+      access_token: accessToken, refresh_token: refreshToken,
+      expires_in: expiresIn, token_type: tokenType, stored_at: Date.now(),
+    });
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    return { success: true };
+  }
+  return false;
+}
+
+function signOut() {
+  clearSession();
+  renderAuthUI();
+}
+
+function renderAuthUI() {
+  const user = currentUser();
+  const signedOutEl = document.getElementById('auth-signed-out');
+  const signedInEl = document.getElementById('auth-signed-in');
+  if (user) {
+    signedOutEl.style.display = 'none';
+    signedInEl.style.display = '';
+    document.getElementById('auth-email-display').textContent = user.email;
+  } else {
+    signedOutEl.style.display = '';
+    signedInEl.style.display = 'none';
+  }
+}
+
+function initAuthUI() {
+  const statusEl = document.getElementById('auth-status');
+  const redirectResult = handleAuthRedirect();
+  if (redirectResult && redirectResult.error) {
+    statusEl.textContent = redirectResult.error;
+    statusEl.style.color = '#E8573F';
+  } else if (redirectResult && redirectResult.success) {
+    statusEl.textContent = "You're signed in.";
+    statusEl.style.color = '#59C88F';
+  }
+
+  renderAuthUI();
+
+  document.getElementById('auth-send-btn').addEventListener('click', async () => {
+    const email = document.getElementById('auth-email').value.trim();
+    if (!email) { statusEl.textContent = 'Enter your email first.'; statusEl.style.color = '#E8573F'; return; }
+    const btn = document.getElementById('auth-send-btn');
+    btn.disabled = true;
+    statusEl.textContent = 'Sending…';
+    statusEl.style.color = '#8B90A8';
+    try {
+      await sendMagicLink(email);
+      statusEl.textContent = 'Check your email for the link (may take a minute).';
+      statusEl.style.color = '#59C88F';
+    } catch (e) {
+      statusEl.textContent = e.message || 'Something went wrong.';
+      statusEl.style.color = '#E8573F';
+    }
+    setTimeout(() => { btn.disabled = false; }, 60000);
+  });
+
+  document.getElementById('auth-signout-btn').addEventListener('click', signOut);
 }
 
 /* ---------------------------------------------------------------
@@ -611,6 +770,12 @@ function boot() {
   initEvents();
   render();
   setInterval(render, 60000);
+}
+
+try {
+  initAuthUI();
+} catch (err) {
+  console.error('Auth UI failed to start:', err);
 }
 
 try {
