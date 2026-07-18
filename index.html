@@ -96,8 +96,24 @@
       <div id="auth-signed-in" style="display:none;">
         <p class="subtle" style="margin-top:0;">Signed in as <strong id="auth-email-display" style="color:#EEF0F6;"></strong></p>
         <button class="pillBtn pillBtnGhost" id="auth-signout-btn" style="width:auto;padding:8px 16px;">Sign out</button>
+        <div id="auth-name-prompt" style="display:none;margin-top:10px;">
+          <p class="subtle" style="margin-top:0;">One-time: what should your crew see your name as?</p>
+          <div class="foodFormRow">
+            <input class="input" id="auth-display-name" type="text" placeholder="Your name" />
+            <button class="pillBtn" id="auth-save-name-btn" style="flex:0 0 auto;padding:9px 16px;">Save</button>
+          </div>
+        </div>
       </div>
     </section>
+
+    <section class="card" id="team-card" style="display:none;">
+      <div class="cardHeader">
+        <span>👥</span><h2 class="h2">Team today</h2>
+        <button id="team-refresh-btn" style="background:none;border:none;color:#8B90A8;font-family:'JetBrains Mono',monospace;font-size:11px;">refresh</button>
+      </div>
+      <div id="team-list"></div>
+    </section>
+
 
     <header class="header">
       <div>
@@ -287,7 +303,7 @@ function currentBlockId() {
 
 const emptyData = () => ({
   waterSlots: {}, extraWaterMl: 0, sunscreen: {}, moisturizer: {},
-  foods: [], symptoms: "none", symptomEvents: [], notes: "",
+  foods: [], symptoms: "none", symptomEvents: [], notes: "", updatedAt: null,
 });
 
 function loadDay(key) {
@@ -409,6 +425,149 @@ function signOut() {
   renderAuthUI();
 }
 
+/* ---------------------------------------------------------------
+   Cloud sync — pushes/pulls today's data and the team summary.
+   Every function here fails soft: if the network or the backend
+   is unavailable, the tracker keeps working from local data only.
+---------------------------------------------------------------- */
+function todayISODate() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+async function apiRequest(path, { method = 'GET', body, extraHeaders = {} } = {}) {
+  const session = loadSession();
+  const headers = { 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json', ...extraHeaders };
+  if (session && session.access_token) headers['Authorization'] = `Bearer ${session.access_token}`;
+  return fetch(`${SUPABASE_URL}${path}`, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+}
+
+async function refreshAccessToken() {
+  const session = loadSession();
+  if (!session || !session.refresh_token) return null;
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: 'POST',
+    headers: { 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token: session.refresh_token }),
+  });
+  if (!res.ok) { clearSession(); return null; }
+  const json = await res.json();
+  saveSession({ access_token: json.access_token, refresh_token: json.refresh_token, expires_in: json.expires_in, token_type: json.token_type, stored_at: Date.now() });
+  return currentUser();
+}
+
+async function ensureFreshToken() {
+  const user = currentUser();
+  if (!user) return null;
+  const payload = decodeJwt(user.session.access_token);
+  if (payload && payload.exp && (payload.exp - Date.now() / 1000) < 300) return refreshAccessToken();
+  return user;
+}
+
+function promptForDisplayName() {
+  return new Promise((resolve) => {
+    const promptEl = document.getElementById('auth-name-prompt');
+    const input = document.getElementById('auth-display-name');
+    const btn = document.getElementById('auth-save-name-btn');
+    promptEl.style.display = '';
+    const handler = () => {
+      const val = input.value.trim();
+      if (!val) return;
+      promptEl.style.display = 'none';
+      btn.removeEventListener('click', handler);
+      resolve(val);
+    };
+    btn.addEventListener('click', handler);
+  });
+}
+
+async function ensureProfile(user, promptForName) {
+  const res = await apiRequest(`/rest/v1/profiles?id=eq.${user.id}&select=display_name`);
+  if (!res.ok) throw new Error('Could not check your profile');
+  const rows = await res.json();
+  if (rows.length > 0) return rows[0].display_name;
+  const name = await promptForName();
+  if (!name) return null;
+  const createRes = await apiRequest('/rest/v1/profiles', { method: 'POST', body: { id: user.id, display_name: name }, extraHeaders: { Prefer: 'return=minimal' } });
+  if (!createRes.ok) throw new Error('Could not save your name');
+  return name;
+}
+
+async function pushDayToCloud(user, dayData) {
+  const res = await apiRequest('/rest/v1/daily_logs?on_conflict=user_id,log_date', {
+    method: 'POST',
+    body: { user_id: user.id, log_date: todayISODate(), data: dayData, updated_at: new Date().toISOString() },
+    extraHeaders: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+  });
+  return res.ok;
+}
+
+async function pullDayFromCloud(user) {
+  const res = await apiRequest(`/rest/v1/daily_logs?user_id=eq.${user.id}&log_date=eq.${todayISODate()}&select=data,updated_at`);
+  if (!res.ok) return null;
+  const rows = await res.json();
+  return rows.length > 0 ? rows[0] : null;
+}
+
+async function pullTeamToday() {
+  const res = await apiRequest('/rest/v1/rpc/team_today', { method: 'POST', body: {} });
+  if (!res.ok) throw new Error('Could not load team status');
+  return res.json();
+}
+
+function renderTeamRow(member) {
+  const flagged = member.symptom_status && member.symptom_status !== 'none';
+  return `<div class="checkItem" style="justify-content:space-between;border-color:${flagged ? '#E8573F66' : '#2A2F40'};">
+    <span>${escapeHtml(member.display_name)}</span>
+    <span class="mono" style="color:${member.water_pct >= 100 ? '#59C88F' : '#8B90A8'};">${member.water_pct}% water</span>
+    ${flagged ? `<span style="color:#E8573F;font-size:12px;">⚠️ ${escapeHtml(member.symptom_status)}</span>` : '<span style="color:#59C88F;font-size:12px;">✓ fine</span>'}
+  </div>`;
+}
+
+async function refreshTeamView() {
+  const user = currentUser();
+  const teamCard = document.getElementById('team-card');
+  if (!user) { teamCard.style.display = 'none'; return; }
+  try {
+    const team = await pullTeamToday();
+    teamCard.style.display = '';
+    document.getElementById('team-list').innerHTML = team.length
+      ? team.map(renderTeamRow).join('')
+      : '<p class="subtle" style="margin:0;">No one\'s logged today yet.</p>';
+  } catch (e) {
+    console.error('Team view failed:', e);
+  }
+}
+
+function syncPushInBackground() {
+  const user = currentUser();
+  if (!user) return;
+  pushDayToCloud(user, data).catch((e) => console.error('Background sync failed:', e));
+}
+
+async function runCloudSync() {
+  try {
+    const user = await ensureFreshToken();
+    if (!user) return;
+    const displayName = await ensureProfile(user, promptForDisplayName);
+    if (!displayName) return;
+    const cloudDay = await pullDayFromCloud(user);
+    if (cloudDay) {
+      const localTime = data.updatedAt ? new Date(data.updatedAt).getTime() : 0;
+      const cloudTime = new Date(cloudDay.updated_at).getTime();
+      if (cloudTime > localTime) {
+        data = { ...emptyData(), ...cloudDay.data };
+        saveDay(todayKey(), data);
+        render();
+      }
+    }
+    await pushDayToCloud(user, data);
+    await refreshTeamView();
+  } catch (e) {
+    console.error('Cloud sync failed:', e);
+  }
+}
+
 function renderAuthUI() {
   const user = currentUser();
   const signedOutEl = document.getElementById('auth-signed-out');
@@ -420,6 +579,7 @@ function renderAuthUI() {
   } else {
     signedOutEl.style.display = '';
     signedInEl.style.display = 'none';
+    document.getElementById('team-card').style.display = 'none';
   }
 }
 
@@ -435,6 +595,7 @@ function initAuthUI() {
   }
 
   renderAuthUI();
+  if (currentUser()) runCloudSync();
 
   document.getElementById('auth-send-btn').addEventListener('click', async () => {
     const email = document.getElementById('auth-email').value.trim();
@@ -466,10 +627,11 @@ let foodForm = { name: "", meal: "Breakfast", servings: 1, calOverride: "", pOve
 let foodIdSeq = 0; // guarantees unique food-entry ids even if two are added in the same millisecond
 
 function updateData(fn) {
-  data = fn(data);
+  data = { ...fn(data), updatedAt: new Date().toISOString() };
   saveDay(todayKey(), data);
   streak = countLoggedDays();
   render();
+  syncPushInBackground();
 }
 
 /* ---------------------------------------------------------------
@@ -759,6 +921,8 @@ function initEvents() {
   });
 
   document.getElementById('notes-textarea').addEventListener('input', (e) => setNotes(e.target.value));
+
+  document.getElementById('team-refresh-btn').addEventListener('click', refreshTeamView);
 }
 
 function boot() {
@@ -769,7 +933,10 @@ function boot() {
 
   initEvents();
   render();
-  setInterval(render, 60000);
+  setInterval(() => {
+    render();
+    if (currentUser()) refreshTeamView();
+  }, 60000);
 }
 
 try {
